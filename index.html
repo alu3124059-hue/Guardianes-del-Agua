@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Guardianes del Agua | Ciencia Ciudadana y Lluvia</title>
+    <!-- Carga de Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Configuración de Tailwind para paleta de colores -->
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        'agua-principal': '#0A66C2', // Azul oscuro para marca
+                        'agua-secundario': '#34D399', // Verde esmeralda para acción
+                        'agua-fondo': '#F8FAFC', // Gris claro para fondo
+                        'agua-oscuro': '#1E3A8A', // Azul marino para texto
+                    },
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                    },
+                }
+            }
+        }
+    </script>
+    <!-- Carga de la librería Leaflet para el mapa -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+    <style>
+        /* Estilos personalizados para el mapa y responsividad */
+        #mapa-lluvia {
+            height: 400px;
+            width: 100%;
+            border-radius: 0.75rem; /* rounded-xl */
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05); /* shadow-xl */
+        }
+        /* Ocultar el scroll horizontal en dispositivos móviles */
+        body {
+            overflow-x: hidden;
+            font-family: 'Inter', sans-serif;
+        }
+        /* Estilo para el contenedor principal centrado */
+        .container-app {
+            max-width: 1200px;
+            margin-left: auto;
+            margin-right: auto;
+            padding: 0 1rem;
+        }
+    </style>
+    <!-- Carga de Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, collection, query, onSnapshot, addDoc, serverTimestamp, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Configuración de Firebase (variables globales obligatorias)
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        // Variables globales
+        window.db = null;
+        window.auth = null;
+        window.userId = 'Cargando...';
+        let isAuthReady = false;
+
+        // Inicializar Firebase
+        window.initializeFirebase = async () => {
+            try {
+                // Configurar el nivel de log (útil para debugging)
+                setLogLevel('Debug');
+
+                const app = initializeApp(firebaseConfig);
+                window.db = getFirestore(app);
+                window.auth = getAuth(app);
+
+                // Autenticación: Usar token si está disponible, sino, anónima
+                if (initialAuthToken) {
+                    await signInWithCustomToken(window.auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(window.auth);
+                }
+
+                // Observador de estado de autenticación
+                onAuthStateChanged(window.auth, (user) => {
+                    if (user) {
+                        window.userId = user.uid;
+                        isAuthReady = true;
+                        document.getElementById('user-id-display').textContent = 'ID de Usuario: ' + window.userId;
+                        console.log("Usuario autenticado. UID:", window.userId);
+                        // Una vez autenticado, podemos iniciar la escucha de datos
+                        window.startRainDataListener();
+                    } else {
+                        // Esto debería ocurrir solo si el token falla
+                        window.userId = 'No autenticado';
+                        isAuthReady = true;
+                        document.getElementById('user-id-display').textContent = 'ID de Usuario: ' + window.userId;
+                        console.error("Fallo la autenticación.");
+                    }
+                });
+
+            } catch (error) {
+                console.error("Error al inicializar Firebase o autenticar:", error);
+            }
+        };
+
+        // Función para enviar datos a Firestore
+        window.reportarLluvia = async (data) => {
+            if (!isAuthReady || !window.db) {
+                document.getElementById('message-box').textContent = "Sistema no listo. Intente de nuevo en un momento.";
+                document.getElementById('message-box').classList.remove('hidden', 'bg-red-100');
+                document.getElementById('message-box').classList.add('bg-yellow-100', 'p-3');
+                console.error("No se puede reportar: Firebase no está listo.");
+                return;
+            }
+
+            try {
+                const collectionPath = `artifacts/${appId}/public/data/rain_reports`;
+                
+                await addDoc(collection(window.db, collectionPath), {
+                    ...data,
+                    userId: window.userId,
+                    timestamp: serverTimestamp()
+                });
+
+                document.getElementById('message-box').textContent = "¡Reporte enviado con éxito! Gracias, Guardián.";
+                document.getElementById('message-box').classList.remove('hidden', 'bg-red-100', 'bg-yellow-100');
+                document.getElementById('message-box').classList.add('bg-agua-secundario', 'text-white', 'p-3');
+
+            } catch (e) {
+                console.error("Error al añadir el documento: ", e);
+                document.getElementById('message-box').textContent = "Error al enviar el reporte. Consulte la consola.";
+                document.getElementById('message-box').classList.remove('hidden', 'bg-agua-secundario', 'bg-yellow-100');
+                document.getElementById('message-box').classList.add('bg-red-500', 'text-white', 'p-3');
+            }
+        };
+
+        // Función para escuchar datos de la colección
+        window.startRainDataListener = () => {
+            const map = window.rainMap; // Acceder al mapa Leaflet
+            const collectionPath = `artifacts/${appId}/public/data/rain_reports`;
+            const rainReportsQuery = query(collection(window.db, collectionPath));
+            
+            // Limpiar marcadores existentes antes de iniciar la nueva escucha
+            if (map) {
+                map.eachLayer(layer => {
+                    if (layer instanceof L.Marker) {
+                        map.removeLayer(layer);
+                    }
+                });
+            }
+
+            onSnapshot(rainReportsQuery, (snapshot) => {
+                const reports = [];
+                snapshot.forEach((doc) => {
+                    const data = doc.data();
+                    reports.push({ id: doc.id, ...data });
+                });
+                
+                // Mostrar datos en el mapa (si está inicializado)
+                window.updateMapWithReports(reports);
+
+                // Actualizar contador
+                document.getElementById('report-count').textContent = reports.length;
+            }, (error) => {
+                console.error("Error al escuchar los datos:", error);
+            });
+        };
+
+        // Iniciar Firebase en cuanto el DOM esté listo
+        document.addEventListener('DOMContentLoaded', window.initializeFirebase);
+    </script>
+</head>
+<body class="bg-agua-fondo text-agua-oscuro min-h-screen">
+
+    <!-- Navbar/Header -->
+    <header class="bg-white shadow-md sticky top-0 z-10">
+        <div class="container-app flex items-center justify-between py-4">
+            <!-- Logo del Proyecto -->
+            <div class="flex items-center space-x-3">
+                <!-- Se usa el logo cargado por el usuario -->
+                <img src="uploaded:image_bf3ddf.jpg-215eba02-fe0e-4f51-8199-5ce96855aa9f" alt="Logo Guardianes del Agua" class="w-10 h-10 rounded-full border border-gray-200">
+                <h1 class="text-xl font-bold text-agua-principal">Guardianes del Agua</h1>
+            </div>
+
+            <!-- Navegación (Desktop) -->
+            <nav class="hidden md:flex space-x-6 font-medium">
+                <a href="#mision" class="text-agua-oscuro hover:text-agua-principal transition duration-200">Nuestra Misión</a>
+                <a href="#reportar" class="text-agua-oscuro hover:text-agua-principal transition duration-200">Reportar Lluvia</a>
+                <a href="#mapa" class="text-agua-oscuro hover:text-agua-principal transition duration-200">Mapa de Datos</a>
+            </nav>
+
+            <!-- Botón de Menú (Mobile) -->
+            <button id="menu-toggle" class="md:hidden text-agua-oscuro focus:outline-none">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16m-7 6h7"></path></svg>
+            </button>
+        </div>
+
+        <!-- Menú Móvil Desplegable -->
+        <div id="mobile-menu" class="hidden md:hidden bg-white border-t border-gray-100">
+            <a href="#mision" class="block py-2 px-6 text-agua-oscuro hover:bg-gray-50">Nuestra Misión</a>
+            <a href="#reportar" class="block py-2 px-6 text-agua-oscuro hover:bg-gray-50">Reportar Lluvia</a>
+            <a href="#mapa" class="block py-2 px-6 text-agua-oscuro hover:bg-gray-50">Mapa de Datos</a>
+        </div>
+    </header>
+
+    <main class="container-app pt-8 pb-16">
+
+        <!-- Sección 1: Hero y Misión -->
+        <section id="mision" class="bg-agua-principal text-white rounded-xl p-8 md:p-12 shadow-xl mb-12">
+            <div class="flex flex-col md:flex-row items-center justify-between">
+                <div class="md:w-3/4">
+                    <h2 class="text-4xl md:text-5xl font-extrabold mb-4">Mide la Lluvia, Protege tu Cuenca</h2>
+                    <p class="text-xl opacity-90 mb-6">
+                        Somos un proyecto de **Ciencia Ciudadana** dedicado a recopilar datos de precipitación en tiempo real. Tu reporte diario nos ayuda a entender el ciclo del agua, prevenir riesgos y gestionar mejor nuestros recursos hídricos.
+                    </p>
+                    <p id="user-id-display" class="text-sm font-mono opacity-70 break-all">ID de Usuario: Cargando...</p>
+                </div>
+                <div class="md:w-1/4 flex justify-center mt-6 md:mt-0">
+                    <!-- Icono de Gota de Agua (Lucide-react: drople, adaptado a SVG simple) -->
+                    <svg class="w-20 h-20 md:w-24 md:h-24 text-agua-secundario" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 2C8.686 2 6 4.686 6 8c0 4.5 6 14 6 14s6-9.5 6-14c0-3.314-2.686-6-6-6z" fill="rgba(255, 255, 255, 0.2)"/>
+                        <circle cx="12" cy="8" r="3" fill="#34D399" />
+                    </svg>
+                </div>
+            </div>
+        </section>
+
+        <!-- Sección 2: Formulario de Reporte de Lluvia -->
+        <section id="reportar" class="mb-12">
+            <h3 class="text-3xl font-bold text-agua-oscuro mb-6 text-center">¡Sé un Guardián! Reporta tu Lluvia</h3>
+            
+            <div id="message-box" class="hidden rounded-lg mb-4 font-semibold text-center transition duration-500"></div>
+
+            <form id="rain-report-form" class="bg-white p-6 md:p-8 rounded-xl shadow-lg border border-gray-100">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    
+                    <!-- Campo 1: Cantidad de Lluvia -->
+                    <div>
+                        <label for="cantidad" class="block text-sm font-medium text-gray-700 mb-1">Cantidad de Lluvia (mm)</label>
+                        <input type="number" id="cantidad" name="cantidad" step="0.1" min="0" required 
+                               class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm p-3 border focus:border-agua-principal focus:ring-agua-principal transition duration-150"
+                               placeholder="Ej: 15.5">
+                    </div>
+
+                    <!-- Campo 2: Fecha de Observación -->
+                    <div>
+                        <label for="fecha" class="block text-sm font-medium text-gray-700 mb-1">Fecha de Observación</label>
+                        <input type="date" id="fecha" name="fecha" required 
+                               class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm p-3 border focus:border-agua-principal focus:ring-agua-principal transition duration-150">
+                    </div>
+
+                    <!-- Campo 3: Latitud -->
+                    <div>
+                        <label for="latitud" class="block text-sm font-medium text-gray-700 mb-1">Latitud (Ej: 19.43)</label>
+                        <input type="number" id="latitud" name="latitud" step="0.0001" required
+                               class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm p-3 border focus:border-agua-principal focus:ring-agua-principal transition duration-150"
+                               placeholder="Haz clic en 'Obtener Ubicación' para auto-completar">
+                    </div>
+
+                    <!-- Campo 4: Longitud -->
+                    <div>
+                        <label for="longitud" class="block text-sm font-medium text-gray-700 mb-1">Longitud (Ej: -99.13)</label>
+                        <input type="number" id="longitud" name="longitud" step="0.0001" required
+                               class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm p-3 border focus:border-agua-principal focus:ring-agua-principal transition duration-150"
+                               placeholder="Haz clic en 'Obtener Ubicación' para auto-completar">
+                    </div>
+                </div>
+
+                <!-- Botón de Geolocalización -->
+                <button type="button" id="get-location-btn"
+                        class="mt-6 w-full md:w-auto px-6 py-3 bg-blue-100 text-agua-principal font-semibold rounded-lg shadow-sm hover:bg-blue-200 transition duration-150 ease-in-out focus:ring-4 focus:ring-blue-300">
+                    Obtener mi Ubicación Actual
+                </button>
+
+                <!-- Botón de Envío -->
+                <button type="submit" id="submit-btn"
+                        class="mt-6 w-full px-6 py-3 bg-agua-secundario text-white font-bold rounded-lg shadow-md hover:bg-green-600 transition duration-150 ease-in-out uppercase text-lg transform hover:scale-[1.01] focus:ring-4 focus:ring-agua-secundario/50">
+                    Enviar Reporte
+                </button>
+            </form>
+        </section>
+
+        <!-- Sección 3: Mapa de Datos y Contadores -->
+        <section id="mapa">
+            <h3 class="text-3xl font-bold text-agua-oscuro mb-4 text-center">Datos de la Red de Guardianes</h3>
+            <p class="text-center text-gray-600 mb-6">Visualiza los aportes de nuestra comunidad en tiempo real.</p>
+            
+            <div class="bg-white p-6 rounded-xl shadow-lg border border-gray-100">
+                <div class="flex justify-between items-center mb-4 p-3 bg-gray-50 rounded-lg">
+                    <p class="text-lg font-semibold text-agua-oscuro">Total de Reportes: <span id="report-count" class="text-agua-principal font-extrabold text-2xl">0</span></p>
+                    <button onclick="window.rainMap.setView([4.65, -74.05], 10)" class="text-sm text-agua-principal hover:underline">Centrar Mapa (Ej: Bogotá)</button>
+                </div>
+                <div id="mapa-lluvia">
+                    <!-- El mapa se inicializa aquí -->
+                </div>
+            </div>
+        </section>
+
+    </main>
+
+    <!-- Footer -->
+    <footer class="bg-agua-oscuro text-white py-8 mt-12">
+        <div class="container-app text-center">
+            <p class="text-lg font-semibold mb-2">Guardianes del Agua © 2024</p>
+            <p class="text-sm opacity-80">Un proyecto de ciencia ciudadana para el monitoreo de la lluvia.</p>
+            <div class="flex justify-center space-x-4 mt-4">
+                <a href="#" class="text-agua-secundario hover:text-white transition duration-200">Privacidad</a>
+                <span class="text-gray-500">|</span>
+                <a href="#" class="text-agua-secundario hover:text-white transition duration-200">Contacto</a>
+            </div>
+        </div>
+    </footer>
+
+
+    <!-- Scripts de Funcionalidad JavaScript -->
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+    <script>
+        // Inicialización del Mapa Leaflet y lógica de la aplicación
+        document.addEventListener('DOMContentLoaded', () => {
+            
+            // 1. Inicialización del Mapa
+            const initialCoords = [4.65, -74.05]; // Coordenadas de ejemplo (Bogotá, Colombia)
+            const initialZoom = 10;
+            
+            window.rainMap = L.map('mapa-lluvia').setView(initialCoords, initialZoom);
+
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '© OpenStreetMap contributors'
+            }).addTo(window.rainMap);
+
+            // Almacena la referencia al mapa en el objeto window para usarlo en el script de Firebase
+            window.rainMap.on('click', function(e) {
+                document.getElementById('latitud').value = e.latlng.lat.toFixed(4);
+                document.getElementById('longitud').value = e.latlng.lng.toFixed(4);
+                
+                // Muestra un mensaje temporal en la caja de mensajes
+                const msgBox = document.getElementById('message-box');
+                msgBox.textContent = `Ubicación seleccionada en el mapa: Lat ${e.latlng.lat.toFixed(4)}, Lon ${e.latlng.lng.toFixed(4)}.`;
+                msgBox.classList.remove('hidden', 'bg-red-500', 'bg-agua-secundario');
+                msgBox.classList.add('bg-blue-100', 'text-agua-principal', 'p-3');
+                setTimeout(() => msgBox.classList.add('hidden'), 3000);
+            });
+            
+            // Función para actualizar los marcadores en el mapa
+            window.updateMapWithReports = (reports) => {
+                const map = window.rainMap;
+
+                // Elimina todos los marcadores existentes
+                map.eachLayer(layer => {
+                    if (layer instanceof L.Marker) {
+                        map.removeLayer(layer);
+                    }
+                });
+
+                // Añade nuevos marcadores
+                reports.forEach(report => {
+                    const lat = parseFloat(report.latitud);
+                    const lon = parseFloat(report.longitud);
+                    const amount = parseFloat(report.cantidad);
+                    const date = report.fecha;
+                    const userId = report.userId ? report.userId.substring(0, 8) + '...' : 'Anónimo';
+
+                    if (lat && lon) {
+                        const color = amount > 20 ? 'red' : amount > 5 ? 'blue' : 'green';
+                        const marker = L.marker([lat, lon], {
+                            icon: L.divIcon({
+                                className: 'custom-div-icon',
+                                html: `<div style="background-color: ${color}; width: 20px; height: 20px; border-radius: 50%; border: 3px solid white; box-shadow: 0 0 5px rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; font-size: 10px;">${amount}</div>`,
+                                iconSize: [20, 20],
+                                iconAnchor: [10, 10]
+                            })
+                        }).addTo(map);
+
+                        const formattedDate = report.timestamp ? new Date(report.timestamp.seconds * 1000).toLocaleString() : date;
+
+                        marker.bindPopup(`
+                            <p class="font-bold text-agua-principal">Reporte de Lluvia</p>
+                            <p>Cantidad: <span class="font-bold text-lg text-agua-secundario">${amount} mm</span></p>
+                            <p>Fecha de Obs.: ${date}</p>
+                            <p>Guardían (ID): ${userId}</p>
+                            <p class="text-xs text-gray-500">Reportado en: ${formattedDate}</p>
+                        `).openPopup();
+                    }
+                });
+            };
+
+            // 2. Lógica del Formulario
+            const form = document.getElementById('rain-report-form');
+            form.addEventListener('submit', async (e) => {
+                e.preventDefault();
+
+                const cantidad = document.getElementById('cantidad').value;
+                const fecha = document.getElementById('fecha').value;
+                const latitud = document.getElementById('latitud').value;
+                const longitud = document.getElementById('longitud').value;
+
+                if (!cantidad || !fecha || !latitud || !longitud) {
+                    document.getElementById('message-box').textContent = "Por favor, complete todos los campos requeridos.";
+                    document.getElementById('message-box').classList.remove('hidden', 'bg-agua-secundario', 'bg-yellow-100');
+                    document.getElementById('message-box').classList.add('bg-red-500', 'text-white', 'p-3');
+                    return;
+                }
+
+                const reportData = {
+                    cantidad,
+                    fecha,
+                    latitud,
+                    longitud
+                };
+
+                // Llamar a la función de Firebase para enviar los datos
+                await window.reportarLluvia(reportData);
+
+                // Limpiar el formulario después del envío exitoso
+                form.reset();
+            });
+
+            // 3. Lógica de Geolocalización
+            document.getElementById('get-location-btn').addEventListener('click', () => {
+                const latInput = document.getElementById('latitud');
+                const lonInput = document.getElementById('longitud');
+
+                if (navigator.geolocation) {
+                    navigator.geolocation.getCurrentPosition(
+                        (position) => {
+                            latInput.value = position.coords.latitude.toFixed(4);
+                            lonInput.value = position.coords.longitude.toFixed(4);
+                            document.getElementById('message-box').textContent = "Ubicación obtenida exitosamente.";
+                            document.getElementById('message-box').classList.remove('hidden', 'bg-red-500', 'bg-agua-secundario');
+                            document.getElementById('message-box').classList.add('bg-yellow-100', 'text-gray-800', 'p-3');
+                            setTimeout(() => document.getElementById('message-box').classList.add('hidden'), 3000);
+                        },
+                        (error) => {
+                            console.error("Error al obtener la ubicación:", error);
+                            document.getElementById('message-box').textContent = "No se pudo obtener la ubicación. Ingrésela manualmente.";
+                            document.getElementById('message-box').classList.remove('hidden', 'bg-agua-secundario', 'bg-yellow-100');
+                            document.getElementById('message-box').classList.add('bg-red-500', 'text-white', 'p-3');
+                        }
+                    );
+                } else {
+                    document.getElementById('message-box').textContent = "Su navegador no soporta Geolocalización.";
+                    document.getElementById('message-box').classList.remove('hidden', 'bg-agua-secundario', 'bg-yellow-100');
+                    document.getElementById('message-box').classList.add('bg-red-500', 'text-white', 'p-3');
+                }
+            });
+
+            // 4. Lógica del Menú Móvil
+            document.getElementById('menu-toggle').addEventListener('click', () => {
+                const menu = document.getElementById('mobile-menu');
+                menu.classList.toggle('hidden');
+            });
+
+        });
+    </script>
+</body>
+</html>
